@@ -1,0 +1,12 @@
+{
+  "name": "travelagent-demo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal travel agent website with a Claude-powered floating chat widget.",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.111.0"
+  }
+}

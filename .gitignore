@@ -1,0 +1,14 @@
+config.env
+__pycache__/
+*.pyc
+
+# Node / Vercel
+node_modules/
+.vercel
+.env
+.env.local
+.env*.local
+npm-debug.log*
+
+.vercel
+.env*
