@@ -190,9 +190,10 @@
     return text.slice(last.index + last[0].length).trim().length === 0;
   }
 
-  async function sendToClaude() {
-    state.busy = true;
-    setSendEnabled(false);
+  // Streams one assistant reply for the given request messages, handling the
+  // typing indicator, the "searching policies" state, and the [[ERROR]] marker.
+  // Returns { ok, text } — text is the clean reply on success.
+  async function runStream(requestMessages) {
     const typingEl = addTyping();
     let assistantEl = null;
     let searchingEl = null;
@@ -203,7 +204,7 @@
       const res = await fetch("/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ messages: state.messages }),
+        body: JSON.stringify({ messages: requestMessages }),
       });
 
       if (!res.ok || !res.body) {
@@ -247,9 +248,7 @@
       if (assistantEl) assistantEl.remove();
       if (searchingEl) searchingEl.remove();
       addBubble("error", "Sorry - " + (err.message || "something went wrong. Please try again."));
-      state.busy = false;
-      setSendEnabled(true);
-      return;
+      return { ok: false };
     }
 
     typingEl.remove();
@@ -262,16 +261,51 @@
       if (cleanBefore) addBubble("assistant", cleanBefore);
       const errMsg = fullText.slice(idx + "[[ERROR]]".length).trim();
       addBubble("error", "Sorry - " + (errMsg || "something went wrong. Please try again."));
-    } else {
-      const cleanText = stripToolMarkers(fullText);
-      if (searchingEl) searchingEl.remove();
-      if (!assistantEl) assistantEl = addBubble("assistant", "");
-      assistantEl.innerHTML = renderMarkdownLite(cleanText);
-      state.messages.push({ role: "assistant", content: cleanText });
+      return { ok: false };
     }
 
+    const cleanText = stripToolMarkers(fullText);
+    if (searchingEl) searchingEl.remove();
+    if (!assistantEl) assistantEl = addBubble("assistant", "");
+    assistantEl.innerHTML = renderMarkdownLite(cleanText);
+    return { ok: true, text: cleanText };
+  }
+
+  async function sendToClaude() {
+    state.busy = true;
+    setSendEnabled(false);
+    const result = await runStream(state.messages);
+    if (result.ok) state.messages.push({ role: "assistant", content: result.text });
     state.busy = false;
     setSendEnabled(true);
+  }
+
+  // Heuristic: does this look like a question aimed at the agent (e.g. about
+  // policies) rather than an answer to the current onboarding prompt? Lets the
+  // user ask about cancellation/baggage/insurance before finishing the trip
+  // questionnaire.
+  function looksLikeAgentQuestion(text) {
+    if (/\?/.test(text)) return true;
+    return /\b(polic(?:y|ies)|cancel|cancellation|refunds?|baggage|luggage|carry[- ]?on|checked bags?|insurance|claims?|coverage|allowances?|fees?|prohibited|liquids)\b/i.test(
+      text
+    );
+  }
+
+  // Answers a one-off question during onboarding without consuming the current
+  // trip question, then re-asks it so the user can continue where they left off.
+  async function answerSideQuestion(text) {
+    if (state.busy) return;
+    addBubble("user", text);
+    input.value = "";
+    autoGrow();
+    clearQuick();
+    state.busy = true;
+    setSendEnabled(false);
+    await runStream([{ role: "user", content: text }]);
+    state.busy = false;
+    setSendEnabled(true);
+    addBubble("assistant", "Back to planning your trip 👇");
+    askCurrentQuestion();
   }
 
   function setSendEnabled(enabled) { sendBtn.disabled = !enabled; }
@@ -284,7 +318,12 @@
   function handleSendClick() {
     if (state.busy) return;
     if (state.mode === "onboarding") {
-      submitAnswer(input.value.trim());
+      const text = input.value.trim();
+      if (text && looksLikeAgentQuestion(text)) {
+        answerSideQuestion(text);
+      } else {
+        submitAnswer(text);
+      }
     } else {
       const text = input.value.trim();
       if (text) sendUserText(text);
@@ -298,7 +337,7 @@
     input.placeholder = "Type your answer…";
     addBubble(
       "assistant",
-      "Hi! I'm Voyagent. Let's plan your trip - answer a few quick questions (or tap a default) and I'll suggest destinations and flights."
+      "Hi! I'm Voyagent. Let's plan your trip - answer a few quick questions (or tap a default) and I'll suggest destinations and flights. You can also ask me about our cancellation, baggage, or insurance policies anytime."
     );
     askCurrentQuestion();
     state.started = true;
