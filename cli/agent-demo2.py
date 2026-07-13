@@ -8,9 +8,21 @@ destinations, flight guidance, and a rough itinerary. After the first
 suggestion you can keep asking follow-up questions in the same session.
 """
 
+import json
+import math
 import os
+import re
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
+
+# Claude's replies can include characters (em dashes, arrows, curly quotes)
+# that the default Windows console codepage (cp1252) can't encode, which
+# crashes a plain print(). Force UTF-8 with a safe fallback instead.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 try:
     import anthropic
@@ -22,6 +34,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_FILE = SCRIPT_DIR / "config.env"
 DEFAULT_MODEL = "claude-sonnet-5"
 MAX_TOKENS = 2000
+MAX_TOOL_ROUNDS = 3
+VOYAGE_MODEL = "voyage-3.5"
 
 SYSTEM_PROMPT = """You are an expert, friendly travel agent helping someone plan a vacation.
 
@@ -39,8 +53,139 @@ Given the traveler's details, respond with:
 4. A few practical tips relevant to the trip (packing, visas, best time to
    book, local customs, etc.) where relevant.
 
+You also have a search_travel_policies tool that searches Voyagent's own
+cancellation, baggage, and travel insurance policy documents. Call it when the
+traveler asks about cancellations, refunds, baggage allowances/fees, lost or
+delayed luggage, or travel insurance coverage/claims. Do not call it for
+general destination, itinerary, or flight-guidance questions. When you use it,
+base your answer on the returned policy text and make clear it reflects
+Voyagent's policy.
+
 Keep the tone helpful and concise. Format the response with clear headings and
 bullet points so it reads well in a plain terminal (no tables)."""
+
+TOOLS = [
+    {
+        "name": "search_travel_policies",
+        "description": (
+            "Search Voyagent's cancellation, baggage, and travel insurance policy "
+            "knowledge base. Call this when the traveler asks about cancellations, "
+            "refunds, baggage allowances/fees, lost or delayed luggage, or travel "
+            "insurance coverage/claims. Do not call it for general destination, "
+            "itinerary, or flight-guidance questions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "A focused search query describing what policy information is needed.",
+                }
+            },
+            "required": ["query"],
+        },
+    }
+]
+
+_kb_cache = {}
+
+
+def _chunk_markdown(markdown: str) -> list:
+    chunks = []
+    current = None
+    for line in markdown.split("\n"):
+        match = re.match(r"^##\s+(.*)", line)
+        if match:
+            if current:
+                chunks.append(current)
+            current = {"heading": match.group(1).strip(), "lines": [line]}
+        elif current:
+            current["lines"].append(line)
+    if current:
+        chunks.append(current)
+    result = []
+    for c in chunks:
+        text = "\n".join(c["lines"]).strip()
+        if text:
+            result.append({"heading": c["heading"], "text": text})
+    return result
+
+
+def _voyage_embed(texts: list, input_type: str) -> list:
+    api_key = os.environ.get("VOYAGE_API_KEY", "").strip()
+    body = json.dumps({"input": texts, "model": VOYAGE_MODEL, "input_type": input_type}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.voyageai.com/v1/embeddings",
+        data=body,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    ordered = sorted(data["data"], key=lambda d: d["index"])
+    return [d["embedding"] for d in ordered]
+
+
+def _cosine_similarity(a: list, b: list) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def _ensure_knowledge_base_embeddings() -> dict:
+    url = os.environ.get("KNOWLEDGE_BASE_URL", "").strip()
+    if _kb_cache.get("url") == url and _kb_cache:
+        return _kb_cache
+    token = os.environ.get("BLOB_READ_WRITE_TOKEN", "").strip()
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        markdown = resp.read().decode("utf-8")
+    chunks = _chunk_markdown(markdown)
+    embeddings = _voyage_embed([c["text"] for c in chunks], "document")
+    _kb_cache.clear()
+    _kb_cache.update({"url": url, "chunks": chunks, "embeddings": embeddings})
+    return _kb_cache
+
+
+def _is_placeholder(value: str) -> bool:
+    value = (value or "").strip()
+    return not value or value.startswith("your-")
+
+
+def search_travel_policies(query: str) -> str:
+    if (
+        _is_placeholder(os.environ.get("VOYAGE_API_KEY", ""))
+        or _is_placeholder(os.environ.get("KNOWLEDGE_BASE_URL", ""))
+        or _is_placeholder(os.environ.get("BLOB_READ_WRITE_TOKEN", ""))
+    ):
+        return (
+            "Policy search is not configured on this server (missing VOYAGE_API_KEY, "
+            "KNOWLEDGE_BASE_URL, or BLOB_READ_WRITE_TOKEN). Answer from general travel "
+            "knowledge and clearly say this is general guidance, not Voyagent's specific policy."
+        )
+    try:
+        kb = _ensure_knowledge_base_embeddings()
+        query_embedding = _voyage_embed([query], "query")[0]
+        ranked = sorted(
+            zip(kb["chunks"], kb["embeddings"]),
+            key=lambda pair: _cosine_similarity(query_embedding, pair[1]),
+            reverse=True,
+        )[:2]
+        return "\n\n---\n\n".join(f"### {c['heading']}\n{c['text']}" for c, _ in ranked)
+    except (urllib.error.URLError, KeyError, ValueError) as e:
+        return (
+            f"Policy search failed: {e}. Answer from general travel knowledge and note "
+            "that you could not confirm Voyagent's specific policy."
+        )
+
+
+def run_tool(name: str, tool_input: dict) -> str:
+    if name == "search_travel_policies":
+        return search_travel_policies(tool_input.get("query", ""))
+    return f"Unknown tool: {name}"
 
 
 def load_env_file(path: Path) -> None:
@@ -108,20 +253,42 @@ def build_user_message(details: dict) -> str:
     )
 
 
-def stream_reply(client: anthropic.Anthropic, messages: list) -> str:
+def run_agent_turn(client: anthropic.Anthropic, messages: list) -> str:
     print("Travel Agent:\n")
-    reply_text = ""
-    with client.messages.stream(
-        model=os.environ.get("CLAUDE_MODEL", DEFAULT_MODEL),
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=messages,
-    ) as stream:
-        for text in stream.text_stream:
-            print(text, end="", flush=True)
-            reply_text += text
+    round_num = 0
+    final_message = None
+    while True:
+        round_num += 1
+        use_tools = round_num <= MAX_TOOL_ROUNDS
+        stream_kwargs = dict(
+            model=os.environ.get("CLAUDE_MODEL", DEFAULT_MODEL),
+            max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=messages,
+        )
+        if use_tools:
+            stream_kwargs["tools"] = TOOLS
+
+        with client.messages.stream(**stream_kwargs) as stream:
+            for text in stream.text_stream:
+                print(text, end="", flush=True)
+            final_message = stream.get_final_message()
+
+        if final_message.stop_reason != "tool_use" or not use_tools:
+            break
+
+        tool_uses = [b for b in final_message.content if b.type == "tool_use"]
+        messages.append({"role": "assistant", "content": final_message.content})
+
+        tool_results = []
+        for tu in tool_uses:
+            print("\n\n[Searching Voyagent policies...]", flush=True)
+            output = run_tool(tu.name, tu.input)
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": output})
+        messages.append({"role": "user", "content": tool_results})
+
     print("\n")
-    return reply_text
+    return "".join(block.text for block in final_message.content if block.type == "text")
 
 
 def main() -> None:
@@ -137,7 +304,7 @@ def main() -> None:
     messages = [{"role": "user", "content": build_user_message(details)}]
 
     try:
-        reply = stream_reply(client, messages)
+        reply = run_agent_turn(client, messages)
     except anthropic.AuthenticationError:
         print(f"Authentication failed - check ANTHROPIC_API_KEY in {ENV_FILE}.")
         sys.exit(1)
@@ -164,12 +331,13 @@ def main() -> None:
             print("Happy travels!")
             break
 
+        turn_start = len(messages)
         messages.append({"role": "user", "content": follow_up})
         try:
-            reply = stream_reply(client, messages)
+            reply = run_agent_turn(client, messages)
         except anthropic.APIError as e:
             print(f"Anthropic API error: {e}")
-            messages.pop()
+            del messages[turn_start:]
             continue
         messages.append({"role": "assistant", "content": reply})
 

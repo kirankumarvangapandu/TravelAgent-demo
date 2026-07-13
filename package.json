@@ -6,7 +6,11 @@
   "engines": {
     "node": ">=18"
   },
+  "scripts": {
+    "ingest": "node scripts/ingest-kb.mjs"
+  },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.111.0"
+    "@anthropic-ai/sdk": "^0.111.0",
+    "@vercel/blob": "^2.6.1"
   }
 }

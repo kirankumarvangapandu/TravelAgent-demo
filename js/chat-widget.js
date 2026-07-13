@@ -175,11 +175,27 @@
     await sendToClaude();
   }
 
+  const TOOL_MARKER_RE = /\[\[TOOL:[^\]]*\]\]/g;
+
+  function stripToolMarkers(text) {
+    return text.replace(TOOL_MARKER_RE, "").trim();
+  }
+
+  // True while the stream's most recent event is a tool-call marker with no
+  // reply text after it yet — i.e. Claude is off running search_travel_policies.
+  function isAwaitingToolResult(text) {
+    const matches = [...text.matchAll(TOOL_MARKER_RE)];
+    if (!matches.length) return false;
+    const last = matches[matches.length - 1];
+    return text.slice(last.index + last[0].length).trim().length === 0;
+  }
+
   async function sendToClaude() {
     state.busy = true;
     setSendEnabled(false);
     const typingEl = addTyping();
     let assistantEl = null;
+    let searchingEl = null;
     let fullText = "";
     let sawError = false;
 
@@ -207,16 +223,29 @@
           sawError = true;
           break;
         }
-        if (!assistantEl) {
-          typingEl.remove();
-          assistantEl = addBubble("assistant", "");
+
+        if (isAwaitingToolResult(fullText)) {
+          if (assistantEl) { assistantEl.remove(); assistantEl = null; }
+          if (!searchingEl) {
+            typingEl.remove();
+            searchingEl = addBubble("assistant", "");
+            searchingEl.classList.add("msg-searching");
+            searchingEl.textContent = "Searching Voyagent policies…";
+          }
+        } else {
+          if (searchingEl) { searchingEl.remove(); searchingEl = null; }
+          if (!assistantEl) {
+            typingEl.remove();
+            assistantEl = addBubble("assistant", "");
+          }
+          assistantEl.innerHTML = renderMarkdownLite(stripToolMarkers(fullText));
         }
-        assistantEl.innerHTML = renderMarkdownLite(fullText);
         body.scrollTop = body.scrollHeight;
       }
     } catch (err) {
       typingEl.remove();
       if (assistantEl) assistantEl.remove();
+      if (searchingEl) searchingEl.remove();
       addBubble("error", "Sorry - " + (err.message || "something went wrong. Please try again."));
       state.busy = false;
       setSendEnabled(true);
@@ -227,13 +256,18 @@
 
     if (sawError) {
       if (assistantEl) assistantEl.remove();
+      if (searchingEl) searchingEl.remove();
       const idx = fullText.indexOf("[[ERROR]]");
-      const cleanBefore = fullText.slice(0, idx).trim();
+      const cleanBefore = stripToolMarkers(fullText.slice(0, idx));
       if (cleanBefore) addBubble("assistant", cleanBefore);
       const errMsg = fullText.slice(idx + "[[ERROR]]".length).trim();
       addBubble("error", "Sorry - " + (errMsg || "something went wrong. Please try again."));
     } else {
-      state.messages.push({ role: "assistant", content: fullText });
+      const cleanText = stripToolMarkers(fullText);
+      if (searchingEl) searchingEl.remove();
+      if (!assistantEl) assistantEl = addBubble("assistant", "");
+      assistantEl.innerHTML = renderMarkdownLite(cleanText);
+      state.messages.push({ role: "assistant", content: cleanText });
     }
 
     state.busy = false;

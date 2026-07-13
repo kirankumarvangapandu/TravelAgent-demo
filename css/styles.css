@@ -197,6 +197,7 @@ img, svg { display: block; max-width: 100%; }
 .msg-assistant ul:last-child { margin-bottom: 0; }
 .msg-assistant li { margin-bottom: 3px; }
 .msg-assistant strong { font-weight: 700; }
+.msg-assistant.msg-searching { font-style: italic; color: var(--ink-muted); }
 .msg-user {
   align-self: flex-end; background: var(--primary); color: #fff;
   border-radius: 14px 14px 4px 14px; padding: 10px 13px; white-space: pre-wrap;
